@@ -9,7 +9,8 @@ import aws_cdk.aws_codepipeline as codepipeline
 import aws_cdk.aws_codepipeline_actions as codepipeline_actions
 import aws_cdk.aws_iam as iam
 import aws_cdk.aws_ecs as ecs
-
+import aws_cdk.aws_ecs_patterns as ecs_patterns
+import aws_cdk.aws_ecr as ecr
 
 class CdkPipelineMeanstackStack(cdk.Stack):
 
@@ -20,18 +21,93 @@ class CdkPipelineMeanstackStack(cdk.Stack):
         
         my_vpc = ec2.Vpc.from_lookup(self, "vpc"+parms['stage'],vpc_id = parms['vpc_id'], is_default = parms["vpc_default"])
 
-        my_security_group = ec2.SecurityGroup.from_security_group_id(self, parms["sg_id"]+parms["stage"], parms["sg_id"])
+        # my_security_group = ec2.SecurityGroup.from_security_group_id(self, parms["sg_id"]+parms["stage"], parms["sg_id"])
 
-        ecs_cluster = ecs.Cluster.from_cluster_attributes(self, parms["ecs_cluster_name"],
-            cluster_name=parms["ecs_cluster_name"],
-            security_groups=[my_security_group],
-            vpc=my_vpc,
+        # ecs_cluster = ecs.Cluster.from_cluster_attributes(self, parms["ecs_cluster_name"],
+        #     cluster_name=parms["ecs_cluster_name"],
+        #     security_groups=[my_security_group],
+        #     vpc=my_vpc,
+        # )
+
+        # ecs_service = ecs.FargateService.from_fargate_service_attributes(self, parms["ecs_fargate_service"],
+        #     cluster=ecs_cluster,
+        #     service_name=parms["ecs_fargate_service"]
+        # )        
+
+        ## Reference to existing ECR Repo
+        ecr_repo = ecr.Repository.from_repository_attributes(self, parms["ecr_repo_name"],
+            repository_name = parms["ecr_repo_name"],
+            repository_arn = parms["ecr_repo_arn"]
         )
 
-        ecs_service = ecs.FargateService.from_fargate_service_attributes(self, parms["ecs_fargate_service"],
-            cluster=ecs_cluster,
-            service_name=parms["ecs_fargate_service"]
-        )        
+        ecs_cluster = ecs.Cluster(self, parms["ecs_cluster_name"], 
+            cluster_name = parms["ecs_cluster_name"],
+            vpc = my_vpc
+        )
+
+        logging = ecs.AwsLogDriver.aws_logs(stream_prefix=parms["ecs_cluster_name"])
+
+        task_role = iam.Role(self, "ecs-task-role-"+self.stack_name,
+            role_name="cdk-ecs-task-role-"+self.stack_name,
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com")
+        )
+
+        execution_role_policy = iam.PolicyStatement(
+            effect=iam.Effect.ALLOW,
+            resources=["*"],
+            actions=[
+                "ecr:GetAuthorizationToken",
+                "ecr:BatchCheckLayerAvailability",
+                "ecr:GetDownloadUrlForLayer",
+                "ecr:BatchGetImage",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+            ]
+        )
+
+        task_definition = ecs.FargateTaskDefinition(self, "ecs-task-def",             
+            task_role=task_role
+        )
+
+        task_definition.add_to_execution_role_policy(execution_role_policy)
+
+        container = task_definition.add_container("mean-stack-front-end",
+            image=ecs.ContainerImage.from_ecr_repository(ecr_repo),
+            memory_limit_mib=512,
+            cpu=256,
+            logging=logging
+        )
+
+        container.add_port_mappings(ecs.PortMapping(
+                container_port=4200,
+                protocol=ecs.Protocol.TCP
+            )
+        )
+
+        fargate_service = ecs_patterns.ApplicationLoadBalancedFargateService(self, parms["ecs_fargate_service"],
+            cluster = ecs_cluster,
+            task_definition = task_definition,
+            public_load_balancer = True,
+            desired_count = 1,
+            listener_port = 80,
+            min_healthy_percent = 100,
+            max_healthy_percent = 200,
+            assign_public_ip = False,
+            task_subnets = ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE),
+            # vpc = my_vpc
+        )
+
+        autoscaling = fargate_service.service.auto_scale_task_count(
+            max_capacity = 4
+        )
+
+        autoscaling.scale_on_cpu_utilization("autoscale-policy",
+            target_utilization_percent = 80,
+            scale_in_cooldown = cdk.Duration.seconds(180),
+            scale_out_cooldown = cdk.Duration.seconds(300)
+        )
+
+
 
         # Github Repo
         gitHubSource = codebuild.Source.git_hub(
@@ -129,7 +205,7 @@ class CdkPipelineMeanstackStack(cdk.Stack):
 
         deploy_action = codepipeline_actions.EcsDeployAction(
             action_name='DeployAction',
-            service=ecs_service,
+            service=fargate_service,
             image_file=codepipeline.ArtifactPath(build_output, 'Angular6/imagedefinitions.json')
         )
 
